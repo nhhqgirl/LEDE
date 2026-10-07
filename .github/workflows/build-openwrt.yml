@@ -1,850 +1,168 @@
 name: Build OpenWrt
 
 on:
+  repository_dispatch:
   workflow_dispatch:
     inputs:
-      lede_ref:
-        description: "LEDE/OpenWrt branch or tag"
+      ssh:
+        description: 'SSH connection to Actions'
         required: false
-        default: "master"
-        type: string
-
-      build_jobs:
-        description: "Number of parallel build jobs"
-        required: false
-        default: "4"
-        type: string
-
-      clean_build:
-        description: "Clean build directories before compiling"
-        required: false
-        default: false
-        type: boolean
-
-  push:
-    paths:
-      - ".github/workflows/build.yml"
-      - ".config"
-      - "config/**"
-      - "files/**"
+        default: 'false'
+  schedule:
+    - cron: 0 19 * * *
 
 env:
-  # ============================================================
-  # Source
-  # ============================================================
-
-  # 默认使用 Lean LEDE。
-  # 注意：当前 coolsnowwolf/lede master 已经不是严格的
-  # OpenWrt 24.10 分支。
-  LEDE_REPO: coolsnowwolf/lede
-
-  # workflow_dispatch 可以覆盖这个值
-  LEDE_REF: master
-
-  # OpenClash 官方仓库
-  OPENCLASH_REPO: vernesong/OpenClash
-  OPENCLASH_REF: master
-
-  # Mihomo Meta
-  MIHOMO_REPO: MetaCubeX/mihomo
-  MIHOMO_REF: Alpha
-
-  # ============================================================
-  # Target
-  # ============================================================
-
-  TARGET: x86
-  SUBTARGET: 64
-
-  # ============================================================
-  # Build
-  # ============================================================
-
-  BUILD_JOBS: 4
-
-  # 你的 .config 文件位置
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: .config
-
-  # Mihomo Meta 最终放置位置
-  MIHOMO_CORE_PATH: files/etc/openclash/core/clash_meta
-
-  # ============================================================
-  # GitHub Actions
-  # ============================================================
-
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
 jobs:
-
-  # ============================================================
-  # 1. Build Mihomo Meta Core
-  # ============================================================
-
-  build-mihomo:
-    name: Build Mihomo Meta Core (amd64-v1)
-
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
 
     steps:
-
-      - name: Checkout Mihomo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.MIHOMO_REPO }}
-          ref: ${{ env.MIHOMO_REF }}
-          path: mihomo
-          fetch-depth: 1
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-          check-latest: true
-          cache: true
-          cache-dependency-path: mihomo/go.sum
-
-      - name: Build Mihomo Meta
-        working-directory: mihomo
-        env:
-          GOOS: linux
-          GOARCH: amd64
-          GOAMD64: v1
-          CGO_ENABLED: 0
-        run: |
-          set -eux
-
-          VERSION="alpha-g$(git rev-parse --short HEAD)"
-          BUILDTIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-
-          mkdir -p bin
-
-          go build \
-            -tags with_gvisor \
-            -trimpath \
-            -ldflags "\
-              -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' \
-              -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' \
-              -w -s -buildid=" \
-            -o bin/clash_meta
-
-          chmod 0755 bin/clash_meta
-
-          file bin/clash_meta
-          ls -lh bin/clash_meta
-
-          echo "MIHOMO_VERSION=${VERSION}" >> "$GITHUB_ENV"
-
-      - name: Prepare Core Artifact
-        run: |
-          set -eux
-
-          mkdir -p artifact/etc/openclash/core
-
-          cp mihomo/bin/clash_meta \
-             artifact/etc/openclash/core/clash_meta
-
-          chmod 0755 \
-             artifact/etc/openclash/core/clash_meta
-
-          file artifact/etc/openclash/core/clash_meta
-
-          sha256sum \
-             artifact/etc/openclash/core/clash_meta \
-             | tee artifact/clash_meta.sha256
-
-      - name: Upload Mihomo Core
-        uses: actions/upload-artifact@v4
-        with:
-          name: mihomo-meta-amd64-v1
-          path: artifact/
-
-
-  # ============================================================
-  # 2. Build Firmware
-  # ============================================================
-
-  build-firmware:
-    name: Build x86_64 Firmware
-
-    runs-on: ubuntu-latest
-
-    needs:
-      - build-mihomo
-
-    env:
-      DEBIAN_FRONTEND: noninteractive
-
-    steps:
-
-      # ----------------------------------------------------------
-      # Checkout LEDE
-      # ----------------------------------------------------------
-
-      - name: Checkout LEDE
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.LEDE_REPO }}
-          ref: ${{ github.event.inputs.lede_ref || env.LEDE_REF }}
-          fetch-depth: 1
-
-      # ----------------------------------------------------------
-      # Basic system information
-      # ----------------------------------------------------------
-
-      - name: Show Build Environment
-        run: |
-          set -eux
-
-          echo "========== CPU =========="
-          nproc
-          lscpu | head -30
-
-          echo
-          echo "========== Memory =========="
-          free -h
-
-          echo
-          echo "========== Disk =========="
-          df -h
-
-          echo
-          echo "========== Source =========="
-          git remote -v
-          git log -1 --oneline
-
-
-      # ----------------------------------------------------------
-      # Install build dependencies
-      # ----------------------------------------------------------
-
-      - name: Install Build Dependencies
-        run: |
-          set -eux
-
-          sudo apt-get update
-
-          sudo apt-get install -y \
-            ack \
-            antlr3 \
-            asciidoc \
-            autoconf \
-            automake \
-            autopoint \
-            binutils \
-            bison \
-            build-essential \
-            bzip2 \
-            ccache \
-            clang \
-            cmake \
-            cpio \
-            device-tree-compiler \
-            flex \
-            gawk \
-            gcc-multilib \
-            g++-multilib \
-            gettext \
-            genisoimage \
-            git \
-            gperf \
-            haveged \
-            help2man \
-            intltool \
-            libc6-dev-i386 \
-            libelf-dev \
-            libfuse-dev \
-            libglib2.0-dev \
-            libgmp3-dev \
-            libltdl-dev \
-            libmpc-dev \
-            libmpfr-dev \
-            libncurses5-dev \
-            libncursesw5-dev \
-            libpython3-dev \
-            libreadline-dev \
-            libssl-dev \
-            libtool \
-            llvm \
-            ninja-build \
-            p7zip \
-            p7zip-full \
-            patch \
-            pkgconf \
-            python3 \
-            python3-pyelftools \
-            python3-setuptools \
-            qemu-utils \
-            rsync \
-            scons \
-            squashfs-tools \
-            subversion \
-            swig \
-            texinfo \
-            uglifyjs \
-            unzip \
-            wget \
-            xmlto \
-            xxd \
-            xz-utils \
-            zlib1g-dev
-
-          sudo apt-get clean
-
-
-      # ----------------------------------------------------------
-      # Git safe directory
-      # ----------------------------------------------------------
-
-      - name: Configure Git
-        run: |
-          set -eux
-
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email \
-            "github-actions[bot]@users.noreply.github.com"
-
-          git config --global advice.detachedHead false
-
-
-      # ----------------------------------------------------------
-      # Download Mihomo artifact
-      # ----------------------------------------------------------
-
-      - name: Download Mihomo Meta Core
-        uses: actions/download-artifact@v4
-        with:
-          name: mihomo-meta-amd64-v1
-          path: mihomo-artifact
-
-
-      # ----------------------------------------------------------
-      # Install Mihomo into firmware FILES
-      # ----------------------------------------------------------
-
-      - name: Install Mihomo Meta Core
-        run: |
-          set -eux
-
-          mkdir -p files/etc/openclash/core
-
-          cp \
-            mihomo-artifact/etc/openclash/core/clash_meta \
-            files/etc/openclash/core/clash_meta
-
-          chmod 0755 \
-            files/etc/openclash/core/clash_meta
-
-          echo
-          echo "========== Mihomo Core =========="
-
-          ls -lh \
-            files/etc/openclash/core/clash_meta
-
-          file \
-            files/etc/openclash/core/clash_meta
-
-          sha256sum \
-            files/etc/openclash/core/clash_meta
-
-
-      # ----------------------------------------------------------
-      # Clone OpenClash
-      # ----------------------------------------------------------
-
-      - name: Install OpenClash Source
-        run: |
-          set -eux
-
-          mkdir -p package/luci-app-openclash
-
-          git clone \
-            --depth=1 \
-            --branch="${OPENCLASH_REF}" \
-            "https://github.com/${OPENCLASH_REPO}.git" \
-            package/luci-app-openclash
-
-          echo
-          echo "========== OpenClash =========="
-
-          find package/luci-app-openclash \
-            -maxdepth 2 \
-            -type f \
-            | head -100
-
-          test -f \
-            package/luci-app-openclash/luci-app-openclash/Makefile
-
-
-      # ----------------------------------------------------------
-      # Update / install feeds
-      # ----------------------------------------------------------
-
-      - name: Update Feeds
-        run: |
-          set -eux
-
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-
-      # ----------------------------------------------------------
-      # Restore user .config
-      # ----------------------------------------------------------
-
-      - name: Check User Config
-        run: |
-          set -eux
-
-          test -f "${CONFIG_FILE}"
-
-          echo
-          echo "========== User .config =========="
-
-          wc -l "${CONFIG_FILE}"
-
-          echo
-          grep -E \
-            '^(CONFIG_TARGET_|CONFIG_PACKAGE_(luci-app-openclash|strongswan|kmod-ipsec|ppp|samba4|nlbwmon))' \
-            "${CONFIG_FILE}" \
-            || true
-
-
-      - name: Apply User Config
-        run: |
-          set -eux
-
-          cp "${CONFIG_FILE}" .config
-
-          echo
-          echo "========== Config Applied =========="
-
-          grep -E \
-            '^(CONFIG_TARGET_|CONFIG_PACKAGE_luci-app-openclash=|CONFIG_PACKAGE_strongswan=|CONFIG_PACKAGE_ppp=)' \
-            .config \
-            || true
-
-
-      # ----------------------------------------------------------
-      # Run defconfig
-      # ----------------------------------------------------------
-
-      - name: Run Defconfig
-        run: |
-          set -eux
-
-          make defconfig
-
-          echo
-          echo "========== Final Target =========="
-
-          grep -E \
-            '^CONFIG_TARGET_x86|^CONFIG_TARGET_KERNEL_PARTSIZE|^CONFIG_TARGET_ROOTFS_PARTSIZE|^CONFIG_GRUB_IMAGES|^CONFIG_TARGET_ROOTFS_SQUASHFS' \
-            .config \
-            || true
-
-          echo
-          echo "========== OpenClash =========="
-
-          grep -E \
-            '^CONFIG_PACKAGE_(luci-app-openclash|dnsmasq-full|dnsmasq_full_nftset|kmod-tun|kmod-nft-tproxy|kmod-inet-diag|ruby|ruby-yaml)=' \
-            .config \
-            || true
-
-          echo
-          echo "========== PPPoE =========="
-
-          grep -E \
-            '^CONFIG_PACKAGE_(ppp|ppp-mod-pppoe|kmod-ppp|kmod-pppoe|kmod-pppox|kmod-slhc)=' \
-            .config \
-            || true
-
-          echo
-          echo "========== strongSwan =========="
-
-          grep -E \
-            '^CONFIG_PACKAGE_(strongswan|strongswan-charon|strongswan-swanctl|strongswan-pki|strongswan-mod-eap-mschapv2|strongswan-mod-eap-identity|strongswan-mod-kernel-netlink|kmod-ipsec|kmod-ipsec4|kmod-ipsec6|kmod-xfrm-interface)=' \
-            .config \
-            || true
-
-          echo
-          echo "========== Offload =========="
-
-          grep -E \
-            '^CONFIG_PACKAGE_(kmod-nft-offload|kmod-flow-offload)=' \
-            .config \
-            || true
-
-
-      # ----------------------------------------------------------
-      # Validate critical configuration
-      # ----------------------------------------------------------
-
-      - name: Validate Configuration
-        run: |
-          set -eux
-
-          fail=0
-
-          check_y() {
-            KEY="$1"
-
-            if grep -q "^${KEY}=y$" .config; then
-              echo "[OK] ${KEY}=y"
-            else
-              echo "[WARN] ${KEY} is not enabled"
-              fail=1
-            fi
-          }
-
-          echo "========== Target =========="
-
-          check_y CONFIG_TARGET_x86
-          check_y CONFIG_TARGET_x86_64
-          check_y CONFIG_TARGET_x86_64_DEVICE_generic
-          check_y CONFIG_GRUB_IMAGES
-          check_y CONFIG_TARGET_ROOTFS_SQUASHFS
-
-          echo
-          echo "========== OpenClash =========="
-
-          check_y CONFIG_PACKAGE_luci-app-openclash
-          check_y CONFIG_PACKAGE_dnsmasq-full
-          check_y CONFIG_PACKAGE_kmod-tun
-          check_y CONFIG_PACKAGE_kmod-nft-tproxy
-          check_y CONFIG_PACKAGE_kmod-inet-diag
-          check_y CONFIG_PACKAGE_ruby
-          check_y CONFIG_PACKAGE_ruby-yaml
-
-          echo
-          echo "========== PPPoE =========="
-
-          check_y CONFIG_PACKAGE_ppp
-          check_y CONFIG_PACKAGE_ppp-mod-pppoe
-          check_y CONFIG_PACKAGE_kmod-ppp
-          check_y CONFIG_PACKAGE_kmod-pppoe
-          check_y CONFIG_PACKAGE_kmod-pppox
-
-          echo
-          echo "========== strongSwan =========="
-
-          check_y CONFIG_PACKAGE_strongswan
-          check_y CONFIG_PACKAGE_strongswan-charon
-          check_y CONFIG_PACKAGE_strongswan-swanctl
-          check_y CONFIG_PACKAGE_strongswan-mod-eap-mschapv2
-          check_y CONFIG_PACKAGE_strongswan-mod-kernel-netlink
-          check_y CONFIG_PACKAGE_kmod-ipsec
-          check_y CONFIG_PACKAGE_kmod-ipsec4
-          check_y CONFIG_PACKAGE_kmod-ipsec6
-          check_y CONFIG_PACKAGE_kmod-xfrm-interface
-
-          echo
-          echo "========== Offload =========="
-
-          if grep -q '^CONFIG_PACKAGE_kmod-nft-offload=y$' .config; then
-            echo "[ERROR] kmod-nft-offload is enabled"
-            fail=1
-          fi
-
-          if grep -q '^CONFIG_PACKAGE_kmod-flow-offload=y$' .config; then
-            echo "[ERROR] kmod-flow-offload is enabled"
-            fail=1
-          fi
-
-          if [ "$fail" -ne 0 ]; then
-            echo
-            echo "Configuration validation failed."
-            echo "Check .config and package availability."
-            exit 1
-          fi
-
-          echo
-          echo "Configuration validation passed."
-
-
-      # ----------------------------------------------------------
-      # Download source packages
-      # ----------------------------------------------------------
-
-      - name: Cache Download Directory
-        uses: actions/cache@v4
-        with:
-          path: |
-            dl
-          key: |
-            lede-dl-${{ runner.os }}-${{ env.TARGET }}-${{ env.SUBTARGET }}-${{ github.sha }}
-          restore-keys: |
-            lede-dl-${{ runner.os }}-${{ env.TARGET }}-${{ env.SUBTARGET }}-
-            lede-dl-${{ runner.os }}-
-
-
-      - name: Download Sources
-        run: |
-          set -eux
-
-          make download \
-            -j"${{ github.event.inputs.build_jobs || env.BUILD_JOBS }}" \
-            V=s
-
-
-      # ----------------------------------------------------------
-      # Optional clean build
-      # ----------------------------------------------------------
-
-      - name: Clean Build Directories
-        if: ${{ github.event.inputs.clean_build == 'true' }}
-        run: |
-          set -eux
-
-          rm -rf \
-            build_dir \
-            staging_dir \
-            tmp
-
-          echo "Build directories cleaned."
-
-
-      # ----------------------------------------------------------
-      # Build firmware
-      # ----------------------------------------------------------
-
-      - name: Compile Firmware
-        run: |
-          set -eux
-
-          JOBS="${{ github.event.inputs.build_jobs || env.BUILD_JOBS }}"
-
-          echo "Build jobs: ${JOBS}"
-
-          make \
-            -j"${JOBS}" \
-            V=s
-
-
-      # ----------------------------------------------------------
-      # Verify build output
-      # ----------------------------------------------------------
-
-      - name: Verify Firmware
-        run: |
-          set -eux
-
-          echo
-          echo "========== Target Output =========="
-
-          find bin/targets \
-            -maxdepth 4 \
-            -type f \
-            -printf '%p\n' \
-            | sort
-
-          echo
-          echo "========== Images =========="
-
-          find bin/targets \
-            -type f \
-            \( \
-              -name '*.img' \
-              -o -name '*.img.gz' \
-              -o -name '*.vmdk' \
-              -o -name '*.qcow2' \
-              -o -name '*.vhdx' \
-              -o -name '*.tar.gz' \
-            \) \
-            -print \
-            | sort
-
-          echo
-          echo "========== OpenClash Core =========="
-
-          find build_dir \
-            -path '*/root-*/*' \
-            -name clash_meta \
-            -type f \
-            -print \
-            2>/dev/null \
-            || true
-
-
-      # ----------------------------------------------------------
-      # Generate build information
-      # ----------------------------------------------------------
-
-      - name: Generate Build Info
-        run: |
-          set -eux
-
-          mkdir -p build-info
-
-          {
-            echo "========================================"
-            echo "LEDE/OpenWrt x86_64 Build"
-            echo "========================================"
-            echo
-
-            echo "Build Time:"
-            date -u
-
-            echo
-            echo "Source:"
-            git remote get-url origin
-
-            echo
-            echo "Source Commit:"
-            git rev-parse HEAD
-
-            echo
-            echo "Source Commit Short:"
-            git rev-parse --short HEAD
-
-            echo
-            echo "OpenClash:"
-            echo "${OPENCLASH_REPO}"
-            echo "${OPENCLASH_REF}"
-
-            echo
-            echo "Mihomo:"
-            echo "${MIHOMO_REPO}"
-            echo "${MIHOMO_REF}"
-
-            echo
-            echo "Target:"
-            echo "x86/64"
-
-            echo
-            echo "Rootfs:"
-            echo "SquashFS"
-
-            echo
-            echo "Kernel Partition:"
-            grep '^CONFIG_TARGET_KERNEL_PARTSIZE=' .config || true
-
-            echo
-            echo "Rootfs Partition:"
-            grep '^CONFIG_TARGET_ROOTFS_PARTSIZE=' .config || true
-
-            echo
-            echo "Mihomo Core:"
-            sha256sum \
-              files/etc/openclash/core/clash_meta \
-              || true
-
-            echo
-            echo "========================================"
-          } > build-info/BUILD_INFO.txt
-
-          cp .config \
-            build-info/final.config
-
-          cp files/etc/openclash/core/clash_meta \
-            build-info/clash_meta
-
-          sha256sum \
-            build-info/clash_meta \
-            > build-info/clash_meta.sha256
-
-          cat build-info/BUILD_INFO.txt
-
-
-      # ----------------------------------------------------------
-      # Package final firmware
-      # ----------------------------------------------------------
-
-      - name: Collect Firmware
-        run: |
-          set -eux
-
-          mkdir -p firmware
-
-          find bin/targets \
-            -type f \
-            \( \
-              -name '*.img' \
-              -o -name '*.img.gz' \
-              -o -name '*.vmdk' \
-              -o -name '*.qcow2' \
-              -o -name '*.vhdx' \
-              -o -name '*.tar.gz' \
-            \) \
-            -exec cp --parents {} firmware/ \;
-
-          cp -r build-info firmware/
-
-          echo
-          echo "========== Firmware Artifact =========="
-
-          find firmware \
-            -type f \
-            -printf '%p %s bytes\n' \
-            | sort
-
-
-      # ----------------------------------------------------------
-      # Generate SHA256
-      # ----------------------------------------------------------
-
-      - name: Generate SHA256
-        working-directory: firmware
-        run: |
-          set -eux
-
-          find . \
-            -type f \
-            ! -name 'SHA256SUMS' \
-            -print0 \
-            | sort -z \
-            | xargs -0 sha256sum \
-            > SHA256SUMS
-
-          cat SHA256SUMS
-
-
-      # ----------------------------------------------------------
-      # Upload firmware
-      # ----------------------------------------------------------
-
-      - name: Upload Firmware Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lede-x86_64-openclash-mihomo
-          path: firmware/
-          if-no-files-found: error
-          retention-days: 14
-
-
-      # ----------------------------------------------------------
-      # Upload complete build configuration
-      # ----------------------------------------------------------
-
-      - name: Upload Final Config
-        uses: actions/upload-artifact@v4
-        with:
-          name: final-config
-          path: |
-            .config
-            build-info/BUILD_INFO.txt
-            build-info/final.config
-            build-info/clash_meta.sha256
-          retention-days: 14
-
-
-      # ----------------------------------------------------------
-      # Show disk usage
-      # ----------------------------------------------------------
-
-      - name: Final Disk Usage
-        if: always()
-        run: |
-          echo "========== Disk Usage =========="
-          df -h
-
-          echo
-          echo "========== Build Directory =========="
-          du -sh \
-            bin \
-            build_dir \
-            staging_dir \
-            tmp \
-            dl \
-            2>/dev/null \
-            || true
-
+    - name: Checkout 检出
+      uses: actions/checkout@main
+
+    - name: Initialization environment 初始化环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Free Disk Space 释放磁盘空间
+      uses: jlumbroso/free-disk-space@main
+      with:
+        # this might remove tools that are actually needed,
+        # if set to "true" but frees about 6 GB
+        tool-cache: true
+        # all of these default to true, but feel free to set to
+        # "false" if necessary for your workflow
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        swap-storage: true
+    
+    - name: Clone source code 克隆源代码
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        cd openwrt
+        COMMIT_MESSAGE=$(git show -s --date=short --format="更新内容: %s")
+        echo "COMMIT_MESSAGE=$COMMIT_MESSAGE" >> $GITHUB_ENV
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds 加载自定义源
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update & Install feeds 更新并安装源
+      working-directory: ./openwrt
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Load custom configuration 加载自定义配置
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package 下载文件包
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware 编译固件
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage 检查空间使用情况
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Organize files 整理文件
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        echo "KERNEL=$(cat *.manifest | grep ^kernel | cut -d- -f2 | tr -d ' ')" >> $GITHUB_ENV
+        rm -rf packages *.buildinfo *.manifest *kernel.bin *rootfs.img.gz profiles.json sha256sums
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory 上传固件目录
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag 生成发布标签
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")
+        echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_OUTPUT
+        touch release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "内核版本: ${{ env.KERNEL }}" >> release.txt
+        echo "${COMMIT_MESSAGE}" >> release.txt
+
+    - name: Upload firmware to release 上传固件到发布页
+      uses: softprops/action-gh-release@master
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete Old Workflows 删除旧工作流
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        retain_days: 0
+        keep_minimum_runs: 2
+    
+    - name: Remove old Releases 删除旧发布
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
